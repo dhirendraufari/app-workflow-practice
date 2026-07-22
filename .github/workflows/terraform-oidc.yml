@@ -1,0 +1,41 @@
+﻿name: Terraform OIDC Init
+
+on:
+    workflow_dispatch:
+    push:
+        branches:
+            - main
+
+permissions:
+    contents: read
+    id-token: write
+
+env:
+    ARM_CLIENT_ID: ${{ secrets.ARM_CLIENT_ID }}
+    ARM_TENANT_ID: ${{ secrets.ARM_TENANT_ID }}
+    ARM_SUBSCRIPTION_ID: ${{ secrets.ARM_SUBSCRIPTION_ID }}
+    ARM_USE_OIDC: true
+
+jobs:
+    terraform-init-oidc:
+        name: Terraform init only (OIDC)
+        runs-on: ubuntu-latest
+        steps:
+            - name: Checkout repository
+              uses: actions/checkout@v4
+              with:
+                  fetch-depth: 0
+
+            - name: Setup Terraform
+              uses: hashicorp/setup-terraform@v2
+              with:
+                  terraform_version: "1.6.7"
+
+            - name: Terraform init (OIDC)
+              run: terraform init -input=false
+
+            - name: Terraform validate
+              run: terraform validate
+
+            - name: Terraform Apply (OIDC)
+              run: terraform apply -auto-approve

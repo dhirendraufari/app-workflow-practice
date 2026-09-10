@@ -1,0 +1,407 @@
+name: CI-CD Pipeline
+
+on:
+  push:
+    branches:
+      - main
+      - develop
+
+  pull_request:
+    branches:
+      - main
+
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Deployment environment"
+        required: true
+        type: choice
+        options:
+          - staging
+          - production
+        default: staging
+
+env:
+  ACR_NAME: myacr
+  REGISTRY: myacr.azurecr.io
+  IMAGE_NAME: app
+
+permissions:
+  contents: read
+  id-token: write
+
+# ============================================================
+# CI - Build, Test, Scan and Publish Immutable Artifacts
+# ============================================================
+
+jobs:
+
+  ci:
+    name: CI - Build Test Scan Publish
+    runs-on: ubuntu-latest
+
+    outputs:
+      image_tag: ${{ steps.meta.outputs.image_tag }}
+
+    steps:
+
+      # --------------------------------------------------------
+      # Checkout
+      # --------------------------------------------------------
+
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # --------------------------------------------------------
+      # Node.js
+      # --------------------------------------------------------
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "18"
+          cache: npm
+
+      # --------------------------------------------------------
+      # Dependencies
+      # --------------------------------------------------------
+
+      - name: Install dependencies
+        run: npm ci
+
+      # --------------------------------------------------------
+      # Unit Test
+      # --------------------------------------------------------
+
+      - name: Run unit tests
+        run: npm test -- --ci
+
+      # --------------------------------------------------------
+      # Code Coverage
+      # --------------------------------------------------------
+
+      - name: Generate code coverage
+        run: npm run test:coverage
+
+      - name: Upload coverage
+        uses: actions/upload-artifact@v4
+        with:
+          name: code-coverage
+          path: coverage/
+
+      # --------------------------------------------------------
+      # Application Build
+      # --------------------------------------------------------
+
+      - name: Build application
+        run: npm run build
+
+      # --------------------------------------------------------
+      # Security - Dependency Audit
+      # --------------------------------------------------------
+
+      - name: NPM security audit
+        run: npm audit --audit-level=high
+
+      # --------------------------------------------------------
+      # Generate immutable image tag
+      # --------------------------------------------------------
+
+      - name: Generate image tag
+        id: meta
+        run: |
+          IMAGE_TAG="${GITHUB_SHA}"
+          echo "image_tag=${IMAGE_TAG}" >> "$GITHUB_OUTPUT"
+
+      # --------------------------------------------------------
+      # Azure Login using OIDC
+      # --------------------------------------------------------
+
+      - name: Azure Login
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      # --------------------------------------------------------
+      # Login to ACR using Azure identity
+      # --------------------------------------------------------
+
+      - name: Login to ACR
+        run: |
+          az acr login --name ${{ env.ACR_NAME }}
+
+      # --------------------------------------------------------
+      # Build Docker image
+      # --------------------------------------------------------
+
+      - name: Build Docker image
+        run: |
+          docker build \
+            -t ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.image_tag }} \
+            .
+
+      # --------------------------------------------------------
+      # Container Security Scan
+      # --------------------------------------------------------
+
+      - name: Scan container image
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.image_tag }}
+          format: table
+          exit-code: "1"
+          ignore-unfixed: true
+          severity: CRITICAL,HIGH
+
+      # --------------------------------------------------------
+      # Push immutable Docker image
+      # --------------------------------------------------------
+
+      - name: Push Docker image
+        if: github.event_name != 'pull_request'
+        run: |
+          docker push \
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.image_tag }}
+
+      # --------------------------------------------------------
+      # Helm Setup
+      # --------------------------------------------------------
+
+      - name: Setup Helm
+        uses: azure/setup-helm@v4
+        with:
+          version: latest
+
+      # --------------------------------------------------------
+      # Helm Lint
+      # --------------------------------------------------------
+
+      - name: Helm lint
+        run: |
+          helm lint ./helm/chart
+
+      # --------------------------------------------------------
+      # Helm Template Validation
+      # --------------------------------------------------------
+
+      - name: Helm template validation
+        run: |
+          helm template app-release ./helm/chart \
+            --namespace staging \
+            --set image.repository=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }} \
+            --set image.tag=${{ steps.meta.outputs.image_tag }}
+
+      # --------------------------------------------------------
+      # Package Helm Chart
+      # --------------------------------------------------------
+
+      - name: Package Helm chart
+        if: github.event_name != 'pull_request'
+        run: |
+          mkdir -p helm-packages
+
+          helm package ./helm/chart \
+            --version 1.0.${GITHUB_RUN_NUMBER} \
+            --app-version "${GITHUB_SHA}" \
+            --destination ./helm-packages
+
+      # --------------------------------------------------------
+      # Push Helm Chart to ACR OCI
+      # --------------------------------------------------------
+
+      - name: Push Helm chart to ACR
+        if: github.event_name != 'pull_request'
+        run: |
+          helm push \
+            ./helm-packages/${{ env.IMAGE_NAME }}-1.0.${GITHUB_RUN_NUMBER}.tgz \
+            oci://${{ env.REGISTRY }}/helm
+
+
+# ============================================================
+# CD - Deploy to Staging
+# ============================================================
+
+  deploy-staging:
+
+    name: Deploy to Staging
+
+    needs: ci
+
+    if: |
+      github.event_name == 'push' &&
+      github.ref == 'refs/heads/develop'
+
+    runs-on: ubuntu-latest
+
+    environment:
+      name: staging
+
+    steps:
+
+      # --------------------------------------------------------
+      # Azure Login using OIDC
+      # --------------------------------------------------------
+
+      - name: Azure Login
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      # --------------------------------------------------------
+      # Setup kubectl
+      # --------------------------------------------------------
+
+      - name: Setup kubectl
+        uses: azure/setup-kubectl@v4
+
+      # --------------------------------------------------------
+      # Setup Helm
+      # --------------------------------------------------------
+
+      - name: Setup Helm
+        uses: azure/setup-helm@v4
+
+      # --------------------------------------------------------
+      # AKS Login
+      # --------------------------------------------------------
+
+      - name: Get AKS credentials
+        run: |
+          az aks get-credentials \
+            --resource-group ${{ secrets.AZURE_RESOURCE_GROUP }} \
+            --name ${{ secrets.AKS_CLUSTER_NAME }} \
+            --overwrite-existing
+
+      # --------------------------------------------------------
+      # ACR Login
+      # --------------------------------------------------------
+
+      - name: Login to ACR
+        run: |
+          az acr login --name ${{ env.ACR_NAME }}
+
+      # --------------------------------------------------------
+      # Deploy using Helm
+      # --------------------------------------------------------
+
+      - name: Deploy application
+        run: |
+          helm upgrade --install app-release \
+            ./helm/chart \
+            --namespace staging \
+            --create-namespace \
+            --values ./helm/values-staging.yaml \
+            --set image.repository=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }} \
+            --set image.tag=${{ needs.ci.outputs.image_tag }} \
+            --atomic \
+            --wait \
+            --timeout 10m
+
+      # --------------------------------------------------------
+      # Verify Deployment
+      # --------------------------------------------------------
+
+      - name: Verify deployment
+        run: |
+          kubectl get pods -n staging
+
+          kubectl rollout status \
+            deployment/app-release \
+            -n staging \
+            --timeout=5m
+
+
+# ============================================================
+# CD - Deploy to Production
+# ============================================================
+
+  deploy-production:
+
+    name: Deploy to Production
+
+    needs:
+      - ci
+      - deploy-staging
+
+    if: |
+      github.event_name == 'push' &&
+      github.ref == 'refs/heads/main'
+
+    runs-on: ubuntu-latest
+
+    environment:
+      name: production
+
+    steps:
+
+      # --------------------------------------------------------
+      # Azure Login using OIDC
+      # --------------------------------------------------------
+
+      - name: Azure Login
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      # --------------------------------------------------------
+      # Setup kubectl
+      # --------------------------------------------------------
+
+      - name: Setup kubectl
+        uses: azure/setup-kubectl@v4
+
+      # --------------------------------------------------------
+      # Setup Helm
+      # --------------------------------------------------------
+
+      - name: Setup Helm
+        uses: azure/setup-helm@v4
+
+      # --------------------------------------------------------
+      # AKS Login
+      # --------------------------------------------------------
+
+      - name: Get AKS credentials
+        run: |
+          az aks get-credentials \
+            --resource-group ${{ secrets.AZURE_RESOURCE_GROUP }} \
+            --name ${{ secrets.AKS_CLUSTER_NAME }} \
+            --overwrite-existing
+
+      # --------------------------------------------------------
+      # Deploy SAME immutable image
+      # --------------------------------------------------------
+
+      - name: Deploy application
+        run: |
+          helm upgrade --install app-release \
+            ./helm/chart \
+            --namespace production \
+            --create-namespace \
+            --values ./helm/values-production.yaml \
+            --set image.repository=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }} \
+            --set image.tag=${{ needs.ci.outputs.image_tag }} \
+            --atomic \
+            --wait \
+            --timeout 10m
+
+      # --------------------------------------------------------
+      # Verify Production
+      # --------------------------------------------------------
+
+      - name: Verify deployment
+        run: |
+          kubectl get pods -n production
+
+          kubectl rollout status \
+            deployment/app-release \
+            -n production \
+            --timeout=5m
+
+          kubectl get deployment -n production
